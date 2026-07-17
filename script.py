@@ -2,8 +2,9 @@
 Numerical reproduction of Wu et al. (2016) Scientific Reports 6:28
 "Model of electrical activity in cardiac tissue under electromagnetic induction"
 
-3-variable FitzHugh-Nagumo model with magnetic flux (memristor coupling):
-  du/dt  = k*u*(u-a)*(1-u) - u*v - k0*rho(phi)*u  [+ Du*laplacian(u) in 2D]
+3-variable FitzHugh-Nagumo model with magnetic flux (memristor coupling),
+eq. (3) of the paper:
+  du/dt  = -k*u*(u-a)*(u-1) - u*v + k0*rho(phi)*u  [+ Du*laplacian(u) in 2D]
   dv/dt  = eps(u,v) * (-v - k*u*(u-a-1))
   dphi/dt = k1*u - k2*phi                          [+ noise on phi if applicable]
 
@@ -11,6 +12,7 @@ where:
   eps(u,v) = eps0 + mu1*v / (u + mu2)   (state-dependent timescale)
   rho(phi) = alpha + 3*beta*phi^2        (memductance)
 
+NOTE — the memristive term is +k0*rho(phi)*u
 Usage:
   python script.py              → interactive menu
   python script.py 1            → generate fig 1 only
@@ -26,7 +28,7 @@ import matplotlib.pyplot as plt
 import os
 import multiprocessing
 
-FIGDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'figures')
+FIGDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'figures_2.0')
 os.makedirs(FIGDIR, exist_ok=True)
 
 # ═══════════════════════════════════════════════
@@ -47,6 +49,9 @@ P = dict(
     # --- observation node (paper's 1-indexed (100,100) → 0-indexed (99,99)) ---
     obs_node      = (99, 99),
 
+    # --- bifurcation reference node (figs 2 & 4): 1-indexed (125,75) → 0-indexed (124,74) ---
+    bif_node      = (124, 74),
+
     # --- fig 1: time series ---
     fig1_k0_vals  = [0.1, 0.4, 0.9],
     fig1_k1       = 0.5,
@@ -60,7 +65,7 @@ P = dict(
     fig2_k1       = 0.5,
     fig2_k2       = 1.0,
     fig2_t_transient = 200,
-    fig2_t_end    = 400,
+    fig2_t_end    = 300,
 
     # --- fig 4: bifurcation vs k2 ---
     fig4_k2_min   = 0.0,
@@ -68,9 +73,8 @@ P = dict(
     fig4_k2_steps = 80,
     fig4_k0       = 0.1,
     fig4_k1       = 0.5,
-    fig4_t_end    = 400,
+    fig4_t_end    = 300,
     fig4_t_transient = 200,
-    fig4_vlines   = [0.15, 3.0],
 
     # --- 2D common ---
     N_grid   = 200,
@@ -91,27 +95,20 @@ P = dict(
     fig11_rad_cx      = 83,
     fig11_rad_cy      = 83,
     fig11_rad_A       = 12.0,
-    fig11_rad_m       = 0.06,
+    fig11_rad_m       = 0.10,
     fig11_snap_times  = [10, 120, 600, 800],
 
-    # --- figs 14 & 15: noise-driven breakup ---
+    # --- fig 14: noise-driven breakup ---
     fig14_k2          = 1.6,
     fig14_warm_time   = 200,
     fig14_noise_cx    = 59,
     fig14_noise_cy    = 59,
     fig14_noise_r     = 40,
-    fig14_noise_D     = 50.0,
-    fig14_snap_times  = [10, 100, 200, 300, 500, 800],
+    fig14_noise_D     = 1.5,
+    fig14_snap_times  = [10, 100, 200, 300, 500, 1000],
     fig14_seed        = 42,
     fig14_dt          = 0.03,
 
-    fig15_nodes       = [(30, 30), (25, 125), (100, 50), (120, 120)],
-    fig15_node_labels = [
-        '(30,30) inside noise',
-        '(25,125) outside noise (r~74)',
-        '(100,50) outside noise (r~42)',
-        '(120,120) far from noise (r~86)',
-    ],
 
     # --- fig 16: spiral at medium k2 ---
     fig16_k2          = 0.5,
@@ -177,13 +174,15 @@ def run_2d_sim(N, dx, dt, n_steps, k0, k1, k2,
                U0, V0, Phi0, noise_params=None,
                em_radiation=None,
                snapshot_steps=None, record_nodes=None,
-               clamp_U=None):
+               clamp_U=None, seed=None):
     U, V, Phi = U0.copy(), V0.copy(), Phi0.copy()
     snapshots = []
     dx2 = dx**2
     snap_set = set(snapshot_steps) if snapshot_steps else set()
 
-    noise_mask = None
+    rng = np.random.default_rng(seed)
+    noise_idx = None
+    n_noise = 0
     D_noise = 0.0
     if noise_params is not None:
         cx, cy = noise_params['cx'], noise_params['cy']
@@ -191,7 +190,9 @@ def run_2d_sim(N, dx, dt, n_steps, k0, k1, k2,
         D_noise = noise_params['D']
         xs = np.arange(N)
         xx, yy = np.meshgrid(xs, xs, indexing='ij')
-        noise_mask = ((xx - cx)**2 + (yy - cy)**2 <= r**2).astype(float)
+        noise_mask = ((xx - cx)**2 + (yy - cy)**2 <= r**2)
+        noise_idx = np.nonzero(noise_mask)
+        n_noise = len(noise_idx[0])
 
     F_rad = None
     if em_radiation is not None:
@@ -207,7 +208,9 @@ def run_2d_sim(N, dx, dt, n_steps, k0, k1, k2,
 
     def _rhs(U, V, Phi):
         rho = P['alpha'] + 3.0 * P['beta'] * Phi**2
-        eps_field = P['eps0'] + P['mu1'] * V / (U + P['mu2'])
+        # Guard the eps singularity: the denominator (u + mu2) blows up for
+        # u < -mu2. Same protection as in bifurcation_2d_peaks.
+        eps_field = P['eps0'] + P['mu1'] * V / np.maximum(U + P['mu2'], 1e-6)
         lap = laplacian2d(U, dx2)
         dU   = -P['k'] * U * (U - P['a']) * (U - 1.0) - U * V + k0 * rho * U + P['Du'] * lap
         dV   = eps_field * (-V - P['k'] * U * (U - P['a'] - 1.0))
@@ -225,8 +228,11 @@ def run_2d_sim(N, dx, dt, n_steps, k0, k1, k2,
         if clamp_U is not None:
             U = np.clip(U, clamp_U[0], clamp_U[1])
 
-        if noise_mask is not None:
-            Phi += dt * np.sqrt(2.0 * D_noise) * np.random.randn(N, N) * noise_mask
+        if noise_idx is not None:
+            # Euler-Maruyama: the stochastic increment scales as sqrt(dt), NOT dt.
+            # The old `dt*sqrt(2D)` form gave an effective D_eff = D*dt, so the
+            # noise vanished as dt->0 and never converged. This is the fix.
+            Phi[noise_idx] += np.sqrt(2.0 * D_noise * dt) * rng.standard_normal(n_noise)
 
         if n in snap_set:
             snapshots.append((n, U.copy(), Phi.copy()))
@@ -238,43 +244,10 @@ def run_2d_sim(N, dx, dt, n_steps, k0, k1, k2,
 
 
 def bifurcation_2d_peaks(k0, k1, k2, n_total, n_transient, N, dx, dt, node):
-    """Run 2D PDE and return on-the-fly detected peaks at *node*.
-
-    Peak detection follows the paper: a value is recorded when it exceeds
-    both its pre-adjacent and post-adjacent samples.  Returns None if the
-    simulation diverges.
+    """Run 2D PDE and return on-the-fly detected peaks at *node* (vectorised).
+    A sample is recorded as a peak when it exceeds its post-adjacent sample
+    and is >= its pre-adjacent sample. Returns None if the simulation diverges.
     """
-    U, V, Phi = init_wedge(N)
-    dx2 = dx ** 2
-    prev2 = U[node]
-    prev1 = U[node]
-    peaks = []
-
-    for n in range(n_total):
-        rho = P['alpha'] + 3.0 * P['beta'] * Phi ** 2
-        eps_f = P['eps0'] + P['mu1'] * V / (U + P['mu2'])
-        lap = laplacian2d(U, dx2)
-        dU = -P['k'] * U * (U - P['a']) * (U - 1.0) - U * V + k0 * rho * U + P['Du'] * lap
-        dV = eps_f * (-V - P['k'] * U * (U - P['a'] - 1.0))
-        dPhi = k1 * U - k2 * Phi
-        U += dt * dU
-        V += dt * dV
-        Phi += dt * dPhi
-
-        curr = float(U[node])
-        if not np.isfinite(curr):
-            return None
-
-        if n > n_transient and prev1 > prev2 and prev1 > curr:
-            peaks.append(prev1)
-        prev2 = prev1
-        prev1 = curr
-
-    return np.array(peaks) if peaks else np.array([prev1])
-
-
-def bifurcation_2d_peaks_fast(k0, k1, k2, n_total, n_transient, N, dx, dt, node):
-    """Fast reimplementation of bifurcation_2d_peaks with vectorised grid ops."""
     U, V, Phi = init_wedge(N)
     dx2 = dx ** 2
     prev2 = float(U[node])
@@ -306,7 +279,7 @@ def bifurcation_2d_peaks_fast(k0, k1, k2, n_total, n_transient, N, dx, dt, node)
             if not np.isfinite(curr):
                 return None
 
-            if n > n_transient and prev1 >= prev2 and prev1 > curr and prev1 > 0.05:
+            if n > n_transient and prev1 >= prev2 and prev1 > curr:
                 peaks.append(prev1)
             prev2 = prev1
             prev1 = curr
@@ -315,9 +288,9 @@ def bifurcation_2d_peaks_fast(k0, k1, k2, n_total, n_transient, N, dx, dt, node)
 
 
 def _bifurcation_worker(args):
-    """Unpack args tuple and call bifurcation_2d_peaks_fast."""
+    """Unpack args tuple and call bifurcation_2d_peaks."""
     param_val, k0, k1, k2, n_total, n_transient, N, dx, dt, node = args
-    peaks = bifurcation_2d_peaks_fast(k0, k1, k2, n_total, n_transient, N, dx, dt, node)
+    peaks = bifurcation_2d_peaks(k0, k1, k2, n_total, n_transient, N, dx, dt, node)
     return param_val, peaks
 
 
@@ -401,7 +374,7 @@ def make_fig2():
     dt = P['dt_2d']
     n_total = int(P['fig2_t_end'] / dt)
     n_transient = int(P['fig2_t_transient'] / dt)
-    node = P['obs_node']
+    node = P['bif_node']
 
     args_list = [
         (k0, k0, P['fig2_k1'], P['fig2_k2'], n_total, n_transient, N, dx, dt, node)
@@ -419,7 +392,7 @@ def make_fig2():
         ax.scatter([k0_val]*len(peaks), peaks, s=0.5, c='k', alpha=0.6)
     ax.set_xlabel('k₀', fontsize=13)
     ax.set_ylabel('max u', fontsize=13)
-    ax.set_title(f'Fig. 2 — Bifurcation: max u vs k₀  (node 100,100)\n'
+    ax.set_title(f'Fig. 2 — Bifurcation: max u vs k₀  (node 125,75)\n'
                  f'k₁={P["fig2_k1"]}, k₂={P["fig2_k2"]}, '
                  f'α={P["alpha"]}, β={P["beta"]}', fontsize=12)
     ax.grid(alpha=0.3)
@@ -439,7 +412,7 @@ def make_fig4():
     dt = P['dt_2d']
     n_total = int(P['fig4_t_end'] / dt)
     n_transient = int(P['fig4_t_transient'] / dt)
-    node = P['obs_node']
+    node = P['bif_node']
 
     args_list = [
         (k2_val, P['fig4_k0'], P['fig4_k1'], k2_val, n_total, n_transient, N, dx, dt, node)
@@ -457,7 +430,7 @@ def make_fig4():
         ax.scatter([k2_val]*len(peaks), peaks, s=0.5, c='navy', alpha=0.6)
     ax.set_xlabel('k₂', fontsize=13)
     ax.set_ylabel('max u', fontsize=13)
-    ax.set_title(f'Fig. 4 — Bifurcation: max u vs k₂  (node 100,100)\n'
+    ax.set_title(f'Fig. 4 — Bifurcation: max u vs k₂  (node 125,75)\n'
                  f'k₀={P["fig4_k0"]}, k₁={P["fig4_k1"]}, '
                  f'α={P["alpha"]}, β={P["beta"]}', fontsize=12)
     ax.grid(alpha=0.3)
@@ -582,8 +555,8 @@ def make_fig11():
     print(f"  Fig 11 saved → {path}")
 
 
-def make_fig14_15():
-    """Figs 14 & 15 — Spiral breakup under EM noise + node time series."""
+def make_fig14():
+    """Fig 14 — Spiral breakup under EM noise."""
     print("  Generating Fig 14 (noise-driven spiral breakup)...")
     N = P['N_grid']
     dx = P['L'] / N
@@ -606,14 +579,11 @@ def make_fig14_15():
 
     pre_snap_steps = [int(t / dt) for t in pre_noise_times]
 
-    node_coords = P['fig15_nodes']
-    node_labels = P['fig15_node_labels']
-
-    snapshots_pre, (U_warm, V_warm, Phi_warm), node_traces_pre = run_2d_sim(
+    snapshots_pre, (U_warm, V_warm, Phi_warm), _ = run_2d_sim(
         N, dx, dt, warm_steps,
         P['k0_2d'], P['k1_2d'], P['fig14_k2'],
         U0, V0, Phi0, snapshot_steps=pre_snap_steps,
-        record_nodes=node_coords, clamp_U=(-0.5, 2.0))
+        clamp_U=(-0.5, 2.0))
 
     snapshots_onset = []
     if at_onset_times:
@@ -621,16 +591,38 @@ def make_fig14_15():
 
     post_noise_relative = [int((t - warm_time) / dt) for t in post_noise_times]
 
-    np.random.seed(P['fig14_seed'])
-    snapshots_post, _, node_traces_post = run_2d_sim(
+    # Time-accounting sanity checks: snapshots from the two phases are
+    # concatenated and zipped *positionally* against all_times, so a silent
+    # mislabelling happens unless the times are ascending, non-negative, and
+    # each lands inside the simulated span. Fail loudly here instead.
+    noisy_duration = (max(post_noise_relative) + 1) * dt if post_noise_relative else 0.0
+    t_end_sim = warm_time + noisy_duration
+    assert all_times == sorted(all_times), (
+        f"fig14_snap_times must be ascending (got {all_times}); the pre/onset/"
+        f"post snapshots are concatenated in time order and zipped by position.")
+    for t in all_times:
+        assert 0 <= t <= t_end_sim, (
+            f"fig14_snap_times contains t={t}, outside the simulated interval "
+            f"[0, {t_end_sim:.1f}] = warm_time({warm_time}) + noisy phase "
+            f"({noisy_duration:.1f}). Adjust fig14_snap_times or fig14_warm_time.")
+
+    snapshots_post, _, _ = run_2d_sim(
         N, dx, dt, max(post_noise_relative) + 1,
         P['k0_2d'], P['k1_2d'], P['fig14_k2'],
         U_warm, V_warm, Phi_warm,
         noise_params=noise_params,
         snapshot_steps=post_noise_relative,
-        record_nodes=node_coords, clamp_U=(-0.5, 2.0))
+        clamp_U=(-0.5, 2.0),
+        seed=P['fig14_seed'])
 
     all_snapshots = snapshots_pre + snapshots_onset + snapshots_post
+
+    # Each requested time must have produced exactly one snapshot; otherwise the
+    # positional zip below would pair frames with the wrong time labels.
+    assert len(all_snapshots) == len(all_times), (
+        f"fig14 produced {len(all_snapshots)} snapshots for {len(all_times)} "
+        f"requested times {all_times}: labels would be misaligned. Ensure each "
+        f"fig14_snap_times value maps to a distinct simulated step (t/dt).")
 
     # Fig 14 — spatial snapshots (2×3 grid)
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
@@ -650,9 +642,6 @@ def make_fig14_15():
                              noise_params['r'], color='white', fill=False,
                              lw=1.5, ls='--', alpha=0.8)
         ax.add_patch(circle)
-        node_colors = ['crimson', 'darkorange', 'steelblue', 'forestgreen']
-        for (nx, ny), nc in zip(node_coords, node_colors):
-            ax.plot(nx, ny, 'o', color=nc, markersize=5, markeredgecolor='white', markeredgewidth=0.8)
         ax.set_xlabel('x')
         ax.set_ylabel('y')
     for j in range(len(all_snapshots), len(axes_flat)):
@@ -669,31 +658,6 @@ def make_fig14_15():
     fig.savefig(path14, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"  Fig 14 saved → {path14}")
-
-    # Fig 15 — node time series
-    print("  Generating Fig 15 (node time series)...")
-    fig, axes = plt.subplots(len(node_coords), 1,
-                             figsize=(12, 2.5 * len(node_coords)), sharex=True)
-    if len(node_coords) == 1:
-        axes = [axes]
-    colors15 = ['crimson', 'darkorange', 'steelblue', 'forestgreen']
-    for ax, c, lbl, col in zip(axes, node_coords, node_labels, colors15):
-        signal = np.array(node_traces_pre[c] + node_traces_post[c])
-        t_arr = np.arange(len(signal)) * dt
-        ax.plot(t_arr, signal, lw=0.5, color=col)
-        ax.axvline(warm_time, color='gray', ls='--', lw=1, alpha=0.6, label='noise onset')
-        ax.set_ylabel('u', fontsize=11)
-        ax.set_title(f'Node {lbl}', fontsize=11)
-        ax.legend(loc='upper right', fontsize=8)
-        ax.grid(alpha=0.3)
-    axes[-1].set_xlabel('time (a.u.)', fontsize=12)
-    fig.suptitle('Fig. 15 — Membrane potential from sampled nodes\n'
-                 f'Gaussian noise on phi, D={P["fig14_noise_D"]}', fontsize=12)
-    fig.tight_layout()
-    path15 = os.path.join(FIGDIR, 'fig15_node_timeseries.png')
-    fig.savefig(path15, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"  Fig 15 saved → {path15}")
 
 
 def make_fig16():
@@ -869,8 +833,7 @@ FIGURES = {
     '4':     ('Bifurcation diagram: max(u) vs k2',       make_fig4),
     '7':     ('Spiral breakup at low k2',                 make_fig7),
     '11':    ('EM radiation spiral disruption',            make_fig11),
-    '14':    ('Noise-driven spiral breakup + node traces', make_fig14_15),
-    '15':    ('(same as 14 — both generated together)',    make_fig14_15),
+    '14':    ('Noise-driven spiral breakup',              make_fig14),
     '16':    ('Spiral pattern at medium k2=0.5',           make_fig16),
     '17':    ('Spiral pattern at high k2=3.0',             make_fig17),
     '18':    ('Varying k1 comparison (k2=1.5)',            make_fig18),
